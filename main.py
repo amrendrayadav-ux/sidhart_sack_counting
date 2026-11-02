@@ -71,7 +71,7 @@ USE_HALF = bool(torch.cuda.is_available())
 
 # This JSON shows that ID 1 (old_class) is the dominant, high-confidence
 # class in White_IMG_6360. Keep ID 0 excluded for this first experiment.
-COUNT_CLASS_IDS = {0,1}
+COUNT_CLASS_IDS = {1}
 
 # ---------------------------------------------------------------
 # HORIZONTAL FULL-WIDTH ZONES:
