@@ -13,10 +13,9 @@ __pycache__/
 !requirements.txt
 
 # Model weights
-*.pt
-*.pth
-*.onnx
-*.engine
+# Allow model checkpoints in model directory
+!model/*.pt
+!model/*.pth
 
 # Environments & IDEs
 .env

@@ -4,10 +4,9 @@
 # ================================================================
 
 import os
+import json
 import math
 import time
-import logging
-import warnings
 from collections import deque
 from datetime import datetime, timezone, timedelta
 
@@ -16,10 +15,6 @@ import numpy as np
 import torch
 from scipy.optimize import linear_sum_assignment
 from ultralytics import YOLO
-
-# Suppress external library and YOLO logging
-warnings.filterwarnings('ignore')
-logging.getLogger('ultralytics').setLevel(logging.ERROR)
 
 # Indian Standard Time (UTC+5:30)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -40,16 +35,30 @@ VIDEO_PATH = (
     'input_videos_training/White_IMG_6360.MP4'
 )
 
-MODEL_PATH = (
+# Resolve model checkpoint: local repository checkpoint if available, fallback to Drive
+_REPO_MODEL_PRIMARY = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model', 'best.pt')
+_REPO_MODEL_ALT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model', 'best (1).pt')
+_DRIVE_MODEL = (
     '/content/drive/MyDrive/Amrendra_Guardex/sidhart_sack_counting/'
     'ultralytics dataset/yolo_dataset/dataset/runs/'
     'throwing_box_two_class/weights/best.pt'
 )
+if os.path.isfile(_REPO_MODEL_PRIMARY):
+    MODEL_PATH = _REPO_MODEL_PRIMARY
+elif os.path.isfile(_REPO_MODEL_ALT):
+    MODEL_PATH = _REPO_MODEL_ALT
+else:
+    MODEL_PATH = _DRIVE_MODEL
 
-OUTPUT_DIR = (
+# Output directory: Colab drive folder if drive mounted, else local output folder
+_DRIVE_OUTPUT_DIR = (
     '/content/drive/MyDrive/Amrendra_Guardex/sidhart_sack_counting/'
     'input_videos_training/White_IMG_6360_horizontal_zone_counting_output'
 )
+if os.path.isdir('/content/drive/MyDrive'):
+    OUTPUT_DIR = _DRIVE_OUTPUT_DIR
+else:
+    OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'output')
 
 # Inference sampling: never process more than 5 FPS.
 TARGET_FPS = 5.0
@@ -125,8 +134,15 @@ DUPLICATE_PAIR_MAX_DY_FRAC = 0.38
 DUPLICATE_PAIR_MAX_OFFSET_STD_X = 45.0
 DUPLICATE_PAIR_MAX_OFFSET_STD_Y = 45.0
 
-# Output settings: Log count in IST only when count increases.
+# Output settings.
+# Keep only count log when count increases; other heavy outputs disabled by default.
+GENERATE_ANNOTATED_VIDEO = False
+SAVE_FRAME_ASSIGNMENTS_JSONL = False
+SAVE_TRACK_PATHS = False
+SAVE_SUMMARY_JSON = False
 SAVE_COUNT_LOG_FILE = True
+DRAW_TRACK_TRAILS = True
+TRAIL_LENGTH = 35
 
 # ================================================================
 # 2. GEOMETRY / DETECTION HELPERS
@@ -238,7 +254,7 @@ class Track:
         self.hits = 1
         self.misses = 0
         self.confidences = [float(det['confidence'])]
-        self.path = deque(maxlen=100)
+        self.path = deque(maxlen=max(TRAIL_LENGTH, 100))
         self.path.append({
             'timestamp_sec': float(timestamp),
             'center_x': float(self.center[0]),
@@ -376,7 +392,7 @@ class Track:
     def rebuild_from_merged_samples(self, samples, zone_a, zone_b):
         """Rebuild one canonical track from two duplicate track histories."""
         samples = sorted(samples, key=lambda z: z['timestamp_sec'])
-        self.path = deque(maxlen=100)
+        self.path = deque(maxlen=max(TRAIL_LENGTH, 100))
         self.confidences = []
         self.first_seen = float(samples[0]['timestamp_sec'])
         self.last_seen = float(samples[0]['timestamp_sec'])
@@ -425,6 +441,27 @@ class Track:
         else:
             self.velocity = np.zeros(2, dtype=np.float64)
         return latest_event
+
+    def to_dict(self):
+        return {
+            'track_id': self.track_id,
+            'class_id': self.class_id,
+            'class_name': 'old_class' if self.class_id == 1 else str(self.class_id),
+            'hits': self.hits,
+            'first_seen_sec': round(self.first_seen, 6),
+            'last_seen_sec': round(self.last_seen, 6),
+            'age_sec': round(self.age_sec, 3),
+            'mean_confidence': round(self.mean_confidence, 4),
+            'counted': bool(self.counted),
+            'count_event': self.count_event,
+            'merged_into': self.merged_into,
+            'merged_track_ids': list(self.merged_track_ids),
+            'last_confirmed_zone': self.confirmed_zone,
+            'start_center_xy': [round(float(self.path[0]['center_x']), 2), round(float(self.path[0]['center_y']), 2)] if self.path else None,
+            'end_center_xy': [round(float(self.center[0]), 2), round(float(self.center[1]), 2)],
+            'velocity_xy_px_per_sec': [round(float(self.velocity[0]), 2), round(float(self.velocity[1]), 2)],
+            'path': list(self.path) if SAVE_TRACK_PATHS else None
+        }
 
 # ================================================================
 # 4. CUSTOM CONSTANT-VELOCITY + HUNGARIAN TRACKER
@@ -709,7 +746,63 @@ class ZoneTracker:
         return detection_to_track, new_events
 
 # ================================================================
-# 5. DIRECT VIDEO INFERENCE & IST COUNT LOGGING
+# 5. DRAWING HELPERS
+# ================================================================
+
+def draw_zone_overlay(frame, zone_a, zone_b):
+    overlay = frame.copy()
+    cv2.fillPoly(overlay, [zone_a], (255, 130, 0))
+    cv2.fillPoly(overlay, [zone_b], (0, 190, 80))
+    cv2.addWeighted(overlay, 0.16, frame, 0.84, 0, frame)
+    cv2.polylines(frame, [zone_a], True, (255, 130, 0), 4)
+    cv2.polylines(frame, [zone_b], True, (0, 190, 80), 4)
+    cv2.putText(frame, 'ZONE A: LOWER', (max(10, int(zone_a[:, 0].min())), max(28, int(zone_a[:, 1].min()) - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 170, 0), 2, cv2.LINE_AA)
+    cv2.putText(frame, 'ZONE B: UPPER', (max(10, int(zone_b[:, 0].min()) + 8), max(28, int(zone_b[:, 1].min()) + 30)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 100), 2, cv2.LINE_AA)
+
+
+def annotate_frame(frame, detections, detection_to_track, tracker, zone_a, zone_b, timestamp):
+    out = frame.copy()
+    draw_zone_overlay(out, zone_a, zone_b)
+
+    # Draw track trails first.
+    if DRAW_TRACK_TRAILS:
+        for tr in tracker.tracks.values():
+            if tr.merged_into is None and len(tr.path) >= 2 and (timestamp - tr.last_seen) <= MAX_TRACK_AGE_SEC:
+                pts = np.array([[int(p['center_x']), int(p['center_y'])] for p in tr.path], dtype=np.int32)
+                if len(pts) >= 2:
+                    cv2.polylines(out, [pts], False, (180, 180, 180), 2, cv2.LINE_AA)
+
+    drawn_track_ids = set()
+    for det in detections:
+        tid = detection_to_track.get(int(det.get('detection_index', -1)))
+        if tid is not None and int(tid) in drawn_track_ids:
+            continue
+        tr = tracker.tracks.get(int(tid)) if tid is not None else None
+        if tid is not None:
+            drawn_track_ids.add(int(tid))
+        # When duplicate detections have been merged, draw the canonical
+        # fused track box once instead of drawing both fragment boxes.
+        bbox_draw = tr.bbox if tr is not None else np.asarray(det['bbox_xyxy'], dtype=np.float64)
+        center_draw = tr.center if tr is not None else np.asarray(det['center_xy'], dtype=np.float64)
+        x1, y1, x2, y2 = [int(round(v)) for v in bbox_draw]
+        counted = bool(tr.counted) if tr is not None else False
+        color = (0, 255, 0) if counted else (255, 220, 0)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        cx, cy = [int(round(v)) for v in center_draw]
+        cv2.circle(out, (cx, cy), 5, (0, 0, 255), -1)
+        label = f"ID {tid if tid is not None else '-'} | old_class | {det['confidence']:.2f}"
+        cv2.putText(out, label, (max(5, x1), max(18, y1 - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2, cv2.LINE_AA)
+
+    cv2.putText(out, f'LOWER -> UPPER: {tracker.zone_a_to_b_count}', (25, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 170, 0), 2, cv2.LINE_AA)
+    cv2.putText(out, f'UPPER -> LOWER: {tracker.zone_b_to_a_count}', (25, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 220, 100), 2, cv2.LINE_AA)
+    cv2.putText(out, f'TOTAL: {tracker.zone_a_to_b_count + tracker.zone_b_to_a_count}', (25, 118), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(out, f'TIME: {timestamp:.2f}s', (25, 155), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+    return out
+
+# ================================================================
+# 6. DIRECT VIDEO INFERENCE
 # ================================================================
 
 def main():
@@ -717,8 +810,13 @@ def main():
         raise FileNotFoundError(f'Input video not found: {VIDEO_PATH}')
     if not os.path.isfile(MODEL_PATH):
         raise FileNotFoundError(f'YOLO model not found: {MODEL_PATH}')
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     video_stem = os.path.splitext(os.path.basename(VIDEO_PATH))[0]
+    result_json_path = os.path.join(OUTPUT_DIR, f'{video_stem}_horizontal_zone_counting_results.json')
+    events_json_path = os.path.join(OUTPUT_DIR, f'{video_stem}_horizontal_zone_count_events.json')
+    frame_jsonl_path = os.path.join(OUTPUT_DIR, f'{video_stem}_horizontal_zone_frame_assignments.jsonl')
+    annotated_path = os.path.join(OUTPUT_DIR, f'{video_stem}_horizontal_zone_annotated_5fps.mp4')
     count_log_path = os.path.join(OUTPUT_DIR, f'{video_stem}_count_log_ist.txt')
 
     log_file = None
@@ -737,22 +835,39 @@ def main():
         raise RuntimeError(f'Could not open video: {VIDEO_PATH}')
 
     source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     if source_fps <= 0 or width <= 0 or height <= 0:
         cap.release()
         raise RuntimeError('Could not read source FPS or video dimensions.')
 
+    duration_sec = total_frames / source_fps if total_frames > 0 else 0.0
     process_every_frame = source_fps <= TARGET_FPS
+    output_fps = min(source_fps, TARGET_FPS)
 
     zone_a = make_zone_polygon(ZONE_A_NORMALIZED, width, height)
     zone_b = make_zone_polygon(ZONE_B_NORMALIZED, width, height)
     tracker = ZoneTracker(zone_a, zone_b)
 
+    writer = None
+    if GENERATE_ANNOTATED_VIDEO:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(annotated_path, fourcc, output_fps, (width, height))
+        if not writer.isOpened():
+            cap.release()
+            raise RuntimeError('Could not create annotated output video.')
+
+    frame_records = []
+    sample_times = []
+    total_raw_detections = 0
+    total_kept_detections = 0
+    inference_seconds = 0.0
     decoded_index = 0
     sample_index = 0
     next_sample_index = 0
     previous_total_count = 0
+    start = time.perf_counter()
 
     try:
         while True:
@@ -762,6 +877,7 @@ def main():
 
             if process_every_frame or decoded_index >= next_sample_index:
                 timestamp = decoded_index / source_fps
+                t0 = time.perf_counter()
                 results = model.predict(
                     source=frame,
                     imgsz=IMGSZ,
@@ -775,6 +891,7 @@ def main():
                     save=False,
                     stream=False
                 )
+                inference_seconds += time.perf_counter() - t0
                 result = results[0]
                 raw_dets = []
 
@@ -801,8 +918,11 @@ def main():
                             'height': y2 - y1
                         })
 
+                total_raw_detections += len(raw_dets)
                 cleaned = nms_frame(raw_dets)
-                tracker.update(cleaned, timestamp)
+                total_kept_detections += len(cleaned)
+                detection_to_track, new_events = tracker.update(cleaned, timestamp)
+                sample_times.append(timestamp)
 
                 # Keep log in IST only when count increases
                 current_total_count = tracker.zone_a_to_b_count + tracker.zone_b_to_a_count
@@ -810,13 +930,55 @@ def main():
                     diff = current_total_count - previous_total_count
                     for i in range(diff):
                         cnt = previous_total_count + i + 1
+                        dir_info = ""
+                        if i < len(new_events):
+                            d = new_events[i].get('direction', '')
+                            if d == 'zone_a_to_zone_b':
+                                dir_info = f" ({ZONE_A_NAME} -> {ZONE_B_NAME})"
+                            elif d == 'zone_b_to_zone_a':
+                                dir_info = f" ({ZONE_B_NAME} -> {ZONE_A_NAME})"
+                            elif d:
+                                dir_info = f" ({d})"
                         now_ist = datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')
-                        log_line = f"[{now_ist}] Count: {cnt}"
+                        log_line = f"[{now_ist}] Count: {cnt}{dir_info}"
                         print(log_line, flush=True)
                         if log_file is not None:
                             log_file.write(log_line + '\n')
                             log_file.flush()
                     previous_total_count = current_total_count
+
+                frame_dets = []
+                for det in cleaned:
+                    det_index = int(det.get('detection_index', -1))
+                    tid = detection_to_track.get(det_index)
+                    frame_dets.append({
+                        'detection_index': det_index,
+                        'track_id': tid,
+                        'class_id': int(det['class_id']),
+                        'class_name': str(det['class_name']),
+                        'confidence': round(float(det['confidence']), 6),
+                        'bbox_xyxy': [round(float(v), 2) for v in det['bbox_xyxy']],
+                        'center_xy': [round(float(v), 2) for v in det['center_xy']],
+                        'zone': get_zone_name(det['center_xy'], zone_a, zone_b)
+                    })
+
+                frame_records.append({
+                    'sample_index': sample_index,
+                    'source_frame_index': decoded_index,
+                    'timestamp_sec': round(timestamp, 6),
+                    'raw_detection_count': len(raw_dets),
+                    'detections_after_filter_nms': len(cleaned),
+                    'detections': frame_dets,
+                    'new_count_events': new_events,
+                    'track_merges_this_frame': list(tracker.last_track_merges),
+                    'cumulative_zone_a_to_b_count': tracker.zone_a_to_b_count,
+                    'cumulative_zone_b_to_a_count': tracker.zone_b_to_a_count,
+                    'cumulative_total_count': tracker.zone_a_to_b_count + tracker.zone_b_to_a_count
+                })
+
+                if writer is not None:
+                    annotated = annotate_frame(frame, cleaned, detection_to_track, tracker, zone_a, zone_b, timestamp)
+                    writer.write(annotated)
 
                 sample_index += 1
                 if not process_every_frame:
@@ -825,8 +987,127 @@ def main():
             decoded_index += 1
     finally:
         cap.release()
+        if writer is not None:
+            writer.release()
         if log_file is not None:
             log_file.close()
+
+    elapsed = time.perf_counter() - start
+    # Canonicalize all historical frame assignments after any later tracklet merges.
+    for rec in frame_records:
+        for det_record in rec['detections']:
+            if det_record.get('track_id') is not None:
+                det_record['track_id'] = tracker.resolve_track_id(det_record['track_id'])
+        rec['new_count_events'] = [
+            e for e in tracker.events
+            if abs(float(e['timestamp_sec']) - float(rec['timestamp_sec'])) < 1e-5
+        ]
+
+    # Rebuild historical cumulative counts from the final corrected event list.
+    events_sorted = sorted(tracker.events, key=lambda e: float(e['timestamp_sec']))
+    running_a = 0
+    running_b = 0
+    event_idx = 0
+    for rec in frame_records:
+        ts = float(rec['timestamp_sec'])
+        while event_idx < len(events_sorted) and float(events_sorted[event_idx]['timestamp_sec']) <= ts + 1e-6:
+            if events_sorted[event_idx]['direction'] == 'zone_a_to_zone_b':
+                running_a += 1
+            else:
+                running_b += 1
+            event_idx += 1
+        rec['cumulative_zone_a_to_b_count'] = running_a
+        rec['cumulative_zone_b_to_a_count'] = running_b
+        rec['cumulative_total_count'] = running_a + running_b
+
+    canonical_tracks = [tr for tr in tracker.tracks.values() if tr.merged_into is None]
+    counted_tracks = [tr for tr in canonical_tracks if tr.counted]
+    tracks_out = [tr.to_dict() for tr in sorted(tracker.tracks.values(), key=lambda z: z.track_id)]
+    actual_sampling_fps = (
+        (len(sample_times) - 1) / (sample_times[-1] - sample_times[0])
+        if len(sample_times) > 1 and sample_times[-1] > sample_times[0] else 0.0
+    )
+
+    summary = {
+        'input_video': VIDEO_PATH,
+        'model_path': MODEL_PATH,
+        'video': {
+            'source_fps': source_fps,
+            'duration_sec': duration_sec,
+            'width': width,
+            'height': height,
+            'source_frames_decoded': decoded_index
+        },
+        'inference': {
+            'target_fps_max': TARGET_FPS,
+            'actual_sampling_fps': actual_sampling_fps,
+            'inference_frames': sample_index,
+            'raw_detections_for_selected_class': total_raw_detections,
+            'detections_after_filter_nms': total_kept_detections,
+            'inference_compute_seconds': inference_seconds,
+            'device': str(DEVICE),
+            'imgsz': IMGSZ,
+            'confidence': YOLO_CONF,
+            'model_iou': YOLO_IOU
+        },
+        'class_filter': {
+            'selected_class_ids': sorted(COUNT_CLASS_IDS) if COUNT_CLASS_IDS is not None else 'all',
+            'class_names': {str(k): (names.get(k, str(k)) if isinstance(names, dict) else names[k]) for k in COUNT_CLASS_IDS} if COUNT_CLASS_IDS is not None else names
+        },
+        'tracking': {
+            'method': 'constant_velocity_prediction + Hungarian assignment + duplicate-tracklet merging',
+            'max_track_age_sec': MAX_TRACK_AGE_SEC,
+            'max_association_cost': MAX_ASSOCIATION_COST,
+            'new_track_conf_min': NEW_TRACK_CONF_MIN,
+            'nms_iou_threshold': NMS_IOU_THRESHOLD,
+            'duplicate_tracklet_merging_enabled': ENABLE_DUPLICATE_TRACKLET_MERGING,
+            'duplicate_pair_min_observations': DUPLICATE_PAIR_MIN_OBSERVATIONS,
+            'duplicate_pair_min_intersection_over_smaller_box': DUPLICATE_PAIR_MIN_INTERSECTION_SMALLER,
+            'duplicate_pair_max_area_ratio': DUPLICATE_PAIR_MAX_AREA_RATIO,
+            'duplicate_pair_max_offset_std_xy': [DUPLICATE_PAIR_MAX_OFFSET_STD_X, DUPLICATE_PAIR_MAX_OFFSET_STD_Y]
+        },
+        'counting': {
+            'method': 'zone-to-zone transition; no line logic',
+            'anchor': 'bounding-box centroid',
+            'zone_a_name': ZONE_A_NAME,
+            'zone_a_polygon_px': zone_a.tolist(),
+            'zone_b_name': ZONE_B_NAME,
+            'zone_b_polygon_px': zone_b.tolist(),
+            'zone_confirm_hits': ZONE_CONFIRM_HITS,
+            'count_once_per_track': COUNT_ONCE_PER_TRACK,
+            'directions': ['zone_a_to_zone_b', 'zone_b_to_zone_a']
+        },
+        'summary': {
+            'zone_a_to_zone_b_count': tracker.zone_a_to_b_count,
+            'zone_b_to_zone_a_count': tracker.zone_b_to_a_count,
+            'total_count': tracker.zone_a_to_b_count + tracker.zone_b_to_a_count,
+            'tracks_created': len(tracker.tracks),
+            'tracks_merged_as_duplicates': sum(1 for tr in tracker.tracks.values() if tr.merged_into is not None),
+            'effective_unique_tracks': len(canonical_tracks),
+            'tracks_counted': len(counted_tracks),
+            'tracks_not_counted': len(canonical_tracks) - len(counted_tracks),
+            'total_wall_time_sec': elapsed
+        },
+        'count_events': tracker.events,
+        'track_merge_events': tracker.track_merge_events,
+        'tracks': tracks_out,
+        'frames': frame_records
+    }
+
+    if SAVE_SUMMARY_JSON:
+        with open(result_json_path, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        with open(events_json_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'summary': summary['summary'],
+                'counting': summary['counting'],
+                'events': tracker.events,
+                'track_merge_events': tracker.track_merge_events
+            }, f, indent=2, ensure_ascii=False)
+    if SAVE_FRAME_ASSIGNMENTS_JSONL:
+        with open(frame_jsonl_path, 'w', encoding='utf-8') as f:
+            for rec in frame_records:
+                f.write(json.dumps(rec, ensure_ascii=False) + '\n')
 
 
 if __name__ == '__main__':
