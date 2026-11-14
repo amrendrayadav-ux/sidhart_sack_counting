@@ -69,9 +69,10 @@ MAX_DET = 300
 DEVICE = 0 if torch.cuda.is_available() else 'cpu'
 USE_HALF = bool(torch.cuda.is_available())
 
-# This JSON shows that ID 1 (old_class) is the dominant, high-confidence
-# class in White_IMG_6360. Keep ID 0 excluded for this first experiment.
-COUNT_CLASS_IDS = {1}
+# Class filtering:
+# Set to None to infer and track ALL classes dynamically (any class can be counted).
+# Can also be set to a specific set like {0}, {1}, or {0, 1}.
+COUNT_CLASS_IDS = None
 
 # ---------------------------------------------------------------
 # HORIZONTAL FULL-WIDTH ZONES:
